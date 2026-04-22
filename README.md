@@ -121,13 +121,13 @@ Or create a LaunchAgent:
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
-cat > ~/Library/LaunchAgents/com.local.usagebar.plist << 'EOF'
+cat > ~/Library/LaunchAgents/io.github.peterflowset.usagebar.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.local.usagebar</string>
+    <string>io.github.peterflowset.usagebar</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/UsageBar</string>
@@ -137,7 +137,7 @@ cat > ~/Library/LaunchAgents/com.local.usagebar.plist << 'EOF'
 </dict>
 </plist>
 EOF
-launchctl load ~/Library/LaunchAgents/com.local.usagebar.plist
+launchctl load ~/Library/LaunchAgents/io.github.peterflowset.usagebar.plist
 ```
 
 ## Contributing

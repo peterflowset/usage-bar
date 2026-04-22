@@ -83,9 +83,12 @@ class UsageAPI {
         var u = ProviderUsage()
         let path = NSHomeDirectory() + "/.claude/.credentials.json"
 
-        guard let data = FileManager.default.contents(atPath: path),
-              let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
+        guard let data = FileManager.default.contents(atPath: path) else {
             u.error = "No auth"
+            return u
+        }
+        guard let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
+            u.error = "Auth format"
             return u
         }
 
@@ -118,9 +121,12 @@ class UsageAPI {
         var u = ProviderUsage()
         let path = NSHomeDirectory() + "/.codex/auth.json"
 
-        guard let data = FileManager.default.contents(atPath: path),
-              let creds = try? JSONDecoder().decode(CodexCredentials.self, from: data) else {
+        guard let data = FileManager.default.contents(atPath: path) else {
             u.error = "No auth"
+            return u
+        }
+        guard let creds = try? JSONDecoder().decode(CodexCredentials.self, from: data) else {
+            u.error = "Auth format"
             return u
         }
 
@@ -271,7 +277,7 @@ struct ContentView: View {
 
 class Panel: NSPanel {
     init() {
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 250, height: 185),
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 280, height: 200),
                    styleMask: [.nonactivatingPanel, .fullSizeContentView],
                    backing: .buffered, defer: false)
         isFloatingPanel = true
@@ -296,6 +302,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var panel: Panel!
     var hostingView: NSHostingView<ContentView>!
+    var globalMonitor: Any?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -311,8 +318,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         hostingView.autoresizingMask = [.width, .height]
         panel.contentView?.addSubview(hostingView)
 
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.panel.orderOut(nil)
+        }
+    }
+
+    func applicationWillTerminate(_ n: Notification) {
+        if let m = globalMonitor {
+            NSEvent.removeMonitor(m)
+            globalMonitor = nil
         }
     }
 
@@ -320,6 +334,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if panel.isVisible {
             panel.orderOut(nil)
         } else {
+            // Fit panel to content
+            let fitting = hostingView.fittingSize
+            if fitting.width > 0 && fitting.height > 0 {
+                panel.setContentSize(fitting)
+            }
             if let b = statusItem.button, let w = b.window {
                 let r = w.convertToScreen(b.convert(b.bounds, to: nil))
                 panel.setFrameOrigin(NSPoint(x: r.midX - panel.frame.width / 2, y: r.minY - panel.frame.height - 2))

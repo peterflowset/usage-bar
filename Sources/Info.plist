@@ -5,7 +5,7 @@
     <key>CFBundleName</key>
     <string>UsageBar</string>
     <key>CFBundleIdentifier</key>
-    <string>com.local.usagebar</string>
+    <string>io.github.peterflowset.usagebar</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
     <key>LSUIElement</key>
