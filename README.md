@@ -66,7 +66,7 @@ The app reads credentials from the standard locations used by the CLI tools:
 
 Authenticate with Claude Code CLI first:
 ```bash
-claude auth
+claude login
 ```
 
 This creates `~/.claude/.credentials.json` which UsageBar reads automatically.
@@ -81,7 +81,21 @@ An alternative shell script `usage.5m.sh` is included for use with [SwiftBar](ht
 
 1. Copy `usage.5m.sh` to your SwiftBar/xbar plugins directory
 2. Make it executable: `chmod +x usage.5m.sh`
-3. The script reads from a cache file that you can populate via a cron job or manually
+3. Populate the cache file `~/.claude/usage-cache.json` from a cron job or launchd agent
+
+The cache file must follow this format:
+
+```json
+{
+  "claude_weekly":  28,
+  "claude_session": 42,
+  "weekly_reset":   1712419200,
+  "session_reset":  1712332800
+}
+```
+
+- `claude_weekly` / `claude_session`: percent used (0–100)
+- `weekly_reset` / `session_reset`: Unix timestamp (seconds since epoch) of the next reset
 
 ## How It Works
 
@@ -90,6 +104,11 @@ An alternative shell script `usage.5m.sh` is included for use with [SwiftBar](ht
    - Claude: `api.anthropic.com/api/oauth/usage`
    - Codex: `chatgpt.com/backend-api/wham/usage`
 3. Displays usage percentages and reset timers in a floating panel
+
+> **⚠️ Note on API stability**
+> Both endpoints are **undocumented / internal APIs** used by the official CLIs.
+> They may change or disappear without notice. If UsageBar shows "API error"
+> after a CLI update, the payload shape or endpoint may have changed.
 
 ## Auto-Start
 

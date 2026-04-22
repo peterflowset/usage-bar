@@ -2,6 +2,16 @@
 
 # SwiftBar Plugin: Claude & Codex Usage
 # Refresh every 5 minutes (filename: usage.5m.sh)
+#
+# Reads from ~/.claude/usage-cache.json with the following fields:
+#   {
+#     "claude_weekly":  <number>,   // percent used in the 7-day window
+#     "claude_session": <number>,   // percent used in the 5-hour window
+#     "weekly_reset":   <unix_ts>,  // reset timestamp (seconds since epoch)
+#     "session_reset":  <unix_ts>   // reset timestamp (seconds since epoch)
+#   }
+#
+# Populate the cache from a cron job or launchd agent that calls the usage APIs.
 
 CLAUDE_CACHE="$HOME/.claude/usage-cache.json"
 
@@ -17,7 +27,7 @@ format_remaining() {
     local diff=$((reset_ts - now))
 
     if [ $diff -le 0 ]; then
-        echo "jetzt"
+        echo "now"
         return
     fi
 
@@ -69,15 +79,15 @@ echo "⚡| size=14"
 echo "---"
 echo "Claude Code | size=13 font=Menlo-Bold"
 echo "---"
-echo "Weekly (7 Tage)"
-echo "--Verbrauch: ${CLAUDE_WEEKLY} | font=Menlo"
-echo "--Reset in: ${WEEKLY_REMAINING} | font=Menlo"
+echo "Weekly (7 days)"
+echo "--Usage: ${CLAUDE_WEEKLY} | font=Menlo"
+echo "--Resets in: ${WEEKLY_REMAINING} | font=Menlo"
 echo "---"
-echo "Session (5 Stunden)"
-echo "--Verbrauch: ${CLAUDE_SESSION} | font=Menlo"
-echo "--Reset in: ${SESSION_REMAINING} | font=Menlo"
+echo "Session (5 hours)"
+echo "--Usage: ${CLAUDE_SESSION} | font=Menlo"
+echo "--Resets in: ${SESSION_REMAINING} | font=Menlo"
 echo "---"
 echo "Codex | size=13 font=Menlo-Bold"
-echo "--Nicht konfiguriert | color=gray"
+echo "--Not configured | color=gray"
 echo "---"
-echo "🔄 Aktualisieren | refresh=true"
+echo "🔄 Refresh | refresh=true"
