@@ -98,8 +98,12 @@ class UsageAPI {
 
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-                u.error = "API error"
+            guard let http = resp as? HTTPURLResponse else {
+                u.error = "Network"
+                return u
+            }
+            guard http.statusCode == 200 else {
+                u.error = http.statusCode == 429 ? "Rate limit" : "API \(http.statusCode)"
                 return u
             }
             let r = try JSONDecoder().decode(ClaudeUsageResponse.self, from: data)
@@ -136,8 +140,12 @@ class UsageAPI {
 
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-                u.error = "API error"
+            guard let http = resp as? HTTPURLResponse else {
+                u.error = "Network"
+                return u
+            }
+            guard http.statusCode == 200 else {
+                u.error = http.statusCode == 429 ? "Rate limit" : "API \(http.statusCode)"
                 return u
             }
             let r = try JSONDecoder().decode(CodexUsageResponse.self, from: data)
