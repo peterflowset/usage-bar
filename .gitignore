@@ -1,0 +1,23 @@
+# Build artifacts
+.build/
+DerivedData/
+
+# Compiled binary
+UsageBar
+
+# macOS
+.DS_Store
+*.xcworkspace
+xcuserdata/
+
+# SwiftPM
+.swiftpm/
+Package.resolved
+
+# IDE
+.idea/
+*.xcuserstate
+
+# Editor
+*.swp
+*~
