@@ -69,7 +69,7 @@ Authenticate with Claude Code CLI first:
 claude login
 ```
 
-This creates `~/.claude/.credentials.json` which UsageBar reads automatically.
+UsageBar reads Claude Code usage from `~/.claude/statusline-debug.json`, which is maintained by Claude Code. If that file is not available, it falls back to the OAuth usage API when `~/.claude/.credentials.json` exists.
 
 ### Codex (OpenAI)
 
@@ -99,11 +99,11 @@ The cache file must follow this format:
 
 ## How It Works
 
-1. Reads OAuth tokens from CLI credential files
-2. Calls the respective usage APIs:
-   - Claude: `api.anthropic.com/api/oauth/usage`
-   - Codex: `chatgpt.com/backend-api/wham/usage`
-3. Displays usage percentages and reset timers in a floating panel
+1. Reads Claude Code usage from `~/.claude/statusline-debug.json`
+2. Falls back to the Claude OAuth usage API when local status data is unavailable
+3. Reads Codex OAuth tokens from `~/.codex/auth.json`
+4. Calls the Codex usage API: `chatgpt.com/backend-api/wham/usage`
+5. Refreshes usage automatically and displays percentages and reset timers in a floating panel
 
 > **⚠️ Note on API stability**
 > Both endpoints are **undocumented / internal APIs** used by the official CLIs.

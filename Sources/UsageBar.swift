@@ -26,13 +26,36 @@ struct ClaudeCredentials: Codable {
 
 struct ClaudeUsageResponse: Codable {
     struct Limit: Codable {
+        let usedPercent: Double?
         let utilization: Double?
         let resetsAt: String?
-        enum CodingKeys: String, CodingKey { case utilization; case resetsAt = "resets_at" }
+        enum CodingKeys: String, CodingKey { case usedPercent = "used_percent"; case utilization; case resetsAt = "resets_at" }
     }
     let fiveHour: Limit?
     let sevenDay: Limit?
-    enum CodingKeys: String, CodingKey { case fiveHour = "five_hour"; case sevenDay = "seven_day" }
+    let sessionRateLimit: Limit?
+    let weeklyRateLimit: Limit?
+    enum CodingKeys: String, CodingKey {
+        case fiveHour = "five_hour"
+        case sevenDay = "seven_day"
+        case sessionRateLimit = "session_rate_limit"
+        case weeklyRateLimit = "weekly_rate_limit"
+    }
+}
+
+struct ClaudeStatuslineDebug: Codable {
+    struct RateLimits: Codable {
+        struct Window: Codable {
+            let usedPercentage: Double?
+            let resetsAt: Int64?
+            enum CodingKeys: String, CodingKey { case usedPercentage = "used_percentage"; case resetsAt = "resets_at" }
+        }
+        let fiveHour: Window?
+        let sevenDay: Window?
+        enum CodingKeys: String, CodingKey { case fiveHour = "five_hour"; case sevenDay = "seven_day" }
+    }
+    let rateLimits: RateLimits?
+    enum CodingKeys: String, CodingKey { case rateLimits = "rate_limits" }
 }
 
 // MARK: - Codex API
@@ -80,6 +103,10 @@ class UsageAPI {
     }
 
     private func fetchClaude() async -> ProviderUsage {
+        if let local = fetchClaudeFromStatusline() {
+            return local
+        }
+
         var u = ProviderUsage()
         let path = NSHomeDirectory() + "/.claude/.credentials.json"
 
@@ -107,16 +134,36 @@ class UsageAPI {
                 return u
             }
             let r = try JSONDecoder().decode(ClaudeUsageResponse.self, from: data)
-            if let s = r.fiveHour {
-                u.sessionPercent = s.utilization ?? 0
+            if let s = r.fiveHour ?? r.sessionRateLimit {
+                u.sessionPercent = s.usedPercent ?? s.utilization ?? 0
                 if let t = s.resetsAt { u.sessionReset = parseISO(t) }
             }
-            if let w = r.sevenDay {
-                u.weeklyPercent = w.utilization ?? 0
+            if let w = r.sevenDay ?? r.weeklyRateLimit {
+                u.weeklyPercent = w.usedPercent ?? w.utilization ?? 0
                 if let t = w.resetsAt { u.weeklyReset = parseISO(t) }
             }
         } catch {
             u.error = "Error"
+        }
+        return u
+    }
+
+    private func fetchClaudeFromStatusline() -> ProviderUsage? {
+        let path = NSHomeDirectory() + "/.claude/statusline-debug.json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let debug = try? JSONDecoder().decode(ClaudeStatuslineDebug.self, from: data),
+              debug.rateLimits != nil else {
+            return nil
+        }
+
+        var u = ProviderUsage()
+        if let s = debug.rateLimits?.fiveHour {
+            u.sessionPercent = s.usedPercentage ?? 0
+            if let t = s.resetsAt { u.sessionReset = Date(timeIntervalSince1970: Double(t)) }
+        }
+        if let w = debug.rateLimits?.sevenDay {
+            u.weeklyPercent = w.usedPercentage ?? 0
+            if let t = w.resetsAt { u.weeklyReset = Date(timeIntervalSince1970: Double(t)) }
         }
         return u
     }
@@ -175,6 +222,7 @@ class UsageAPI {
 struct ProviderRow: View {
     let name: String
     let usage: ProviderUsage
+    let now: Date
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -183,8 +231,8 @@ struct ProviderRow: View {
             if let e = usage.error {
                 Text(e).font(.system(size: 11)).foregroundColor(.red)
             } else {
-                Row(label: "5h", pct: usage.sessionPercent, reset: usage.sessionReset)
-                Row(label: "7d", pct: usage.weeklyPercent, reset: usage.weeklyReset)
+                Row(label: "5h", pct: usage.sessionPercent, reset: usage.sessionReset, now: now)
+                Row(label: "7d", pct: usage.weeklyPercent, reset: usage.weeklyReset, now: now)
             }
         }
     }
@@ -194,6 +242,7 @@ struct Row: View {
     let label: String
     let pct: Double
     let reset: Date?
+    let now: Date
 
     var body: some View {
         HStack(spacing: 6) {
@@ -224,7 +273,7 @@ struct Row: View {
     var color: Color { pct >= 80 ? .red : pct >= 60 ? .orange : .green }
 
     func remaining(_ d: Date) -> String {
-        let s = d.timeIntervalSinceNow
+        let s = d.timeIntervalSince(now)
         if s <= 0 { return "now" }
         let h = Int(s) / 3600, m = (Int(s) % 3600) / 60
         if h >= 24 { return "\(h/24)d" }
@@ -235,6 +284,7 @@ struct Row: View {
 struct ContentView: View {
     @State private var state = AppState()
     @State private var loading = false
+    @State private var now = Date()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -252,8 +302,8 @@ struct ContentView: View {
 
             Divider()
 
-            ProviderRow(name: "Claude", usage: state.claude)
-            ProviderRow(name: "Codex", usage: state.codex).padding(.top, 4)
+            ProviderRow(name: "Claude", usage: state.claude, now: now)
+            ProviderRow(name: "Codex", usage: state.codex, now: now).padding(.top, 4)
 
             Divider()
 
@@ -267,13 +317,22 @@ struct ContentView: View {
             }
         }
         .padding(14)
-        .task { await load() }
+        .task { await autoRefresh() }
     }
 
     func load() async {
         loading = true
         state = await UsageAPI.shared.fetchAll()
+        now = Date()
         loading = false
+    }
+
+    func autoRefresh() async {
+        await load()
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(30))
+            await load()
+        }
     }
 
     func fmt(_ d: Date) -> String {
