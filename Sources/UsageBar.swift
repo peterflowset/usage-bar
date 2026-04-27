@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Security
 
 // MARK: - Models
 
@@ -108,19 +109,15 @@ class UsageAPI {
         }
 
         var u = ProviderUsage()
-        let path = NSHomeDirectory() + "/.claude/.credentials.json"
 
-        guard let data = FileManager.default.contents(atPath: path) else {
-            u.error = "No auth"
-            return u
-        }
-        guard let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
-            u.error = "Auth format"
+        let auth = fetchClaudeAccessToken()
+        guard let token = auth.token else {
+            u.error = auth.error ?? "No auth"
             return u
         }
 
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        req.setValue("Bearer \(creds.claudeAiOauth.accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
 
         do {
@@ -150,6 +147,15 @@ class UsageAPI {
 
     private func fetchClaudeFromStatusline() -> ProviderUsage? {
         let path = NSHomeDirectory() + "/.claude/statusline-debug.json"
+        // Only trust the cached file when it was written very recently
+        // (i.e. an active Claude Code session is producing fresh data).
+        // Otherwise the values may belong to a previous account/session
+        // and we should hit the live API instead.
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date,
+              Date().timeIntervalSince(mtime) < 60 else {
+            return nil
+        }
         guard let data = FileManager.default.contents(atPath: path),
               let debug = try? JSONDecoder().decode(ClaudeStatuslineDebug.self, from: data),
               debug.rateLimits != nil else {
@@ -166,6 +172,43 @@ class UsageAPI {
             if let t = w.resetsAt { u.weeklyReset = Date(timeIntervalSince1970: Double(t)) }
         }
         return u
+    }
+
+    private func fetchClaudeAccessToken() -> (token: String?, error: String?) {
+        // Linux/Windows path: plain JSON file
+        let path = NSHomeDirectory() + "/.claude/.credentials.json"
+        if let data = FileManager.default.contents(atPath: path) {
+            guard let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
+                return (nil, "Auth format")
+            }
+            return (creds.claudeAiOauth.accessToken, nil)
+        }
+
+        // macOS: credentials are stored in the login keychain
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        switch status {
+        case errSecSuccess:
+            guard let data = item as? Data,
+                  let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
+                return (nil, "Auth format")
+            }
+            return (creds.claudeAiOauth.accessToken, nil)
+        case errSecItemNotFound:
+            return (nil, "No auth")
+        case errSecInteractionNotAllowed:
+            return (nil, "Keychain locked")
+        case errSecAuthFailed, errSecUserCanceled:
+            return (nil, "Keychain denied")
+        default:
+            return (nil, "Keychain \(status)")
+        }
     }
 
     private func fetchCodex() async -> ProviderUsage {
