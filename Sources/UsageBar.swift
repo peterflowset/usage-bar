@@ -11,9 +11,10 @@ struct ModelLimit {
 }
 
 struct ProviderUsage {
-    var sessionPercent: Double = 0
+    // nil = the provider does not report this window; the row is hidden
+    var sessionPercent: Double?
     var sessionReset: Date?
-    var weeklyPercent: Double = 0
+    var weeklyPercent: Double?
     var weeklyReset: Date?
     var modelLimits: [ModelLimit] = []
     var error: String?
@@ -106,14 +107,28 @@ struct CodexUsageResponse: Codable {
         struct Window: Codable {
             let usedPercent: Int?
             let resetAt: Int64?
-            enum CodingKeys: String, CodingKey { case usedPercent = "used_percent"; case resetAt = "reset_at" }
+            let limitWindowSeconds: Int64?
+            enum CodingKeys: String, CodingKey {
+                case usedPercent = "used_percent"
+                case resetAt = "reset_at"
+                case limitWindowSeconds = "limit_window_seconds"
+            }
         }
         let primaryWindow: Window?
         let secondaryWindow: Window?
         enum CodingKeys: String, CodingKey { case primaryWindow = "primary_window"; case secondaryWindow = "secondary_window" }
     }
+    struct AdditionalRateLimit: Codable {
+        let limitName: String?
+        let rateLimit: RateLimit?
+        enum CodingKeys: String, CodingKey { case limitName = "limit_name"; case rateLimit = "rate_limit" }
+    }
     let rateLimit: RateLimit?
-    enum CodingKeys: String, CodingKey { case rateLimit = "rate_limit" }
+    let additionalRateLimits: [AdditionalRateLimit]?
+    enum CodingKeys: String, CodingKey {
+        case rateLimit = "rate_limit"
+        case additionalRateLimits = "additional_rate_limits"
+    }
 }
 
 // MARK: - API Client
@@ -298,13 +313,28 @@ class UsageAPI {
                 return u
             }
             let r = try JSONDecoder().decode(CodexUsageResponse.self, from: data)
-            if let p = r.rateLimit?.primaryWindow {
-                u.sessionPercent = Double(p.usedPercent ?? 0)
-                if let t = p.resetAt { u.sessionReset = Date(timeIntervalSince1970: Double(t)) }
+            // Windows are classified by their actual duration, not their
+            // position: the API nowadays reports the weekly limit as
+            // primary_window (secondary is null), so primary != 5h.
+            let windows = [(r.rateLimit?.primaryWindow, false), (r.rateLimit?.secondaryWindow, true)]
+            for (w, positionalWeekly) in windows {
+                guard let w else { continue }
+                let isWeekly = w.limitWindowSeconds.map { $0 >= 86400 } ?? positionalWeekly
+                if isWeekly {
+                    u.weeklyPercent = Double(w.usedPercent ?? 0)
+                    if let t = w.resetAt { u.weeklyReset = Date(timeIntervalSince1970: Double(t)) }
+                } else {
+                    u.sessionPercent = Double(w.usedPercent ?? 0)
+                    if let t = w.resetAt { u.sessionReset = Date(timeIntervalSince1970: Double(t)) }
+                }
             }
-            if let s = r.rateLimit?.secondaryWindow {
-                u.weeklyPercent = Double(s.usedPercent ?? 0)
-                if let t = s.resetAt { u.weeklyReset = Date(timeIntervalSince1970: Double(t)) }
+            // Named per-model/feature limits (e.g. "GPT-5.3-Codex-Spark")
+            for extra in r.additionalRateLimits ?? [] {
+                guard let name = extra.limitName, let w = extra.rateLimit?.primaryWindow else { continue }
+                let short = name.count > 7 ? String(name.split(separator: "-").last ?? Substring(name)) : name
+                u.modelLimits.append(ModelLimit(name: short,
+                                                percent: Double(w.usedPercent ?? 0),
+                                                reset: w.resetAt.map { Date(timeIntervalSince1970: Double($0)) }))
             }
         } catch {
             u.error = "Error"
@@ -334,8 +364,12 @@ struct ProviderRow: View {
                 Text(e).font(.system(size: 11)).foregroundColor(.red)
             } else {
                 let w: CGFloat = usage.modelLimits.isEmpty ? 20 : 42
-                Row(label: "5h", pct: usage.sessionPercent, reset: usage.sessionReset, now: now, labelWidth: w)
-                Row(label: "7d", pct: usage.weeklyPercent, reset: usage.weeklyReset, now: now, labelWidth: w)
+                if let p = usage.sessionPercent {
+                    Row(label: "5h", pct: p, reset: usage.sessionReset, now: now, labelWidth: w)
+                }
+                if let p = usage.weeklyPercent {
+                    Row(label: "7d", pct: p, reset: usage.weeklyReset, now: now, labelWidth: w)
+                }
                 ForEach(usage.modelLimits, id: \.name) { m in
                     Row(label: m.name, pct: m.percent, reset: m.reset, now: now, labelWidth: w)
                 }
