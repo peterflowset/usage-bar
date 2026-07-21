@@ -28,8 +28,16 @@ struct AppState {
 // MARK: - Claude API
 
 struct ClaudeCredentials: Codable {
-    struct OAuth: Codable { let accessToken: String }
+    struct OAuth: Codable {
+        let accessToken: String
+        let expiresAt: Int64?
+    }
     let claudeAiOauth: OAuth
+
+    var isExpired: Bool {
+        guard let exp = claudeAiOauth.expiresAt else { return false }
+        return Double(exp) / 1000 < Date().timeIntervalSince1970
+    }
 }
 
 struct ClaudeUsageResponse: Codable {
@@ -215,16 +223,24 @@ class UsageAPI {
     }
 
     private func fetchClaudeAccessToken() -> (token: String?, error: String?) {
-        // Linux/Windows path: plain JSON file
+        // macOS keeps the live token in the login keychain; a leftover
+        // ~/.claude/.credentials.json may hold a long-expired one. Prefer
+        // whichever source is not expired (keychain first).
+        var fileError: String?
+        var fileToken: String?
         let path = NSHomeDirectory() + "/.claude/.credentials.json"
         if let data = FileManager.default.contents(atPath: path) {
-            guard let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
-                return (nil, "Auth format")
+            if let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) {
+                if creds.isExpired {
+                    fileError = "Auth expired"
+                } else {
+                    fileToken = creds.claudeAiOauth.accessToken
+                }
+            } else {
+                fileError = "Auth format"
             }
-            return (creds.claudeAiOauth.accessToken, nil)
         }
 
-        // macOS: credentials are stored in the login keychain
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -237,17 +253,20 @@ class UsageAPI {
         case errSecSuccess:
             guard let data = item as? Data,
                   let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
-                return (nil, "Auth format")
+                return (fileToken, fileToken != nil ? nil : "Auth format")
+            }
+            if creds.isExpired {
+                return (fileToken, fileToken != nil ? nil : "Auth expired")
             }
             return (creds.claudeAiOauth.accessToken, nil)
         case errSecItemNotFound:
-            return (nil, "No auth")
+            return (fileToken, fileToken != nil ? nil : (fileError ?? "No auth"))
         case errSecInteractionNotAllowed:
-            return (nil, "Keychain locked")
+            return (fileToken, fileToken != nil ? nil : "Keychain locked")
         case errSecAuthFailed, errSecUserCanceled:
-            return (nil, "Keychain denied")
+            return (fileToken, fileToken != nil ? nil : "Keychain denied")
         default:
-            return (nil, "Keychain \(status)")
+            return (fileToken, fileToken != nil ? nil : "Keychain \(status)")
         }
     }
 
