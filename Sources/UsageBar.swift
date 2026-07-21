@@ -504,6 +504,62 @@ class Panel: NSPanel {
     }
 }
 
+// MARK: - CLI mode (for terminals / cmux Dock)
+
+enum CLI {
+    static func color(_ pct: Double) -> String { pct >= 80 ? "\u{1B}[31m" : pct >= 60 ? "\u{1B}[33m" : "\u{1B}[32m" }
+
+    static func bar(_ pct: Double, width: Int = 18) -> String {
+        let filled = min(max(Int((pct / 100 * Double(width)).rounded()), 0), width)
+        return color(pct) + String(repeating: "█", count: filled)
+            + "\u{1B}[0m\u{1B}[2m" + String(repeating: "░", count: width - filled) + "\u{1B}[0m"
+    }
+
+    static func remaining(_ d: Date?, now: Date) -> String {
+        guard let d else { return "" }
+        let s = d.timeIntervalSince(now)
+        if s <= 0 { return "now" }
+        let h = Int(s) / 3600, m = (Int(s) % 3600) / 60
+        if h >= 24 { return "\(h/24)d" }
+        return h > 0 ? "\(h)h" : "\(m)m"
+    }
+
+    static func row(_ label: String, _ pct: Double, _ reset: Date?, now: Date) -> String {
+        let l = label.count > 6 ? String(label.prefix(6)) : label.padding(toLength: 6, withPad: " ", startingAt: 0)
+        let p = String(format: "%3.0f%%", pct)
+        let r = remaining(reset, now: now)
+        return "  \(l) \(bar(pct)) \(color(pct))\(p)\u{1B}[0m \u{1B}[2m\(r)\u{1B}[0m"
+    }
+
+    static func section(_ name: String, _ u: ProviderUsage, now: Date) -> String {
+        var lines = ["\u{1B}[1m\(name)\u{1B}[0m"]
+        if let e = u.error {
+            lines.append("  \u{1B}[31m\(e)\u{1B}[0m")
+        } else {
+            if let p = u.sessionPercent { lines.append(row("5h", p, u.sessionReset, now: now)) }
+            if let p = u.weeklyPercent { lines.append(row("7d", p, u.weeklyReset, now: now)) }
+            for m in u.modelLimits { lines.append(row(m.name, m.percent, m.reset, now: now)) }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    static func run(once: Bool) async {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"
+        while true {
+            let state = await UsageAPI.shared.fetchAll()
+            let now = Date()
+            var out = once ? "" : "\u{1B}[2J\u{1B}[H"
+            out += "\u{1B}[1mUsage\u{1B}[0m \u{1B}[2m\(f.string(from: now))\u{1B}[0m\n\n"
+            out += section("Claude", state.claude, now: now) + "\n\n"
+            out += section("Codex", state.codex, now: now) + "\n"
+            print(out, terminator: "")
+            fflush(stdout)
+            if once { exit(0) }
+            try? await Task.sleep(for: .seconds(60))
+        }
+    }
+}
+
 // MARK: - App
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -556,8 +612,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+if CommandLine.arguments.contains("--cli") || CommandLine.arguments.contains("--once") {
+    Task.detached { await CLI.run(once: CommandLine.arguments.contains("--once")) }
+    dispatchMain()
+} else {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    app.run()
+}

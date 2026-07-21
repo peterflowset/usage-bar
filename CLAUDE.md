@@ -13,8 +13,14 @@ swift build
 # Release build
 swift build -c release
 
-# Run
+# Run (menu bar app)
 ./.build/release/UsageBar
+
+# Run in a terminal (ANSI output, refreshes every 60s; --once for a single snapshot)
+./.build/release/UsageBar --cli
+
+# Install CLI copy used by the cmux Dock control (~/.config/cmux/dock.json)
+cp ./.build/release/UsageBar ~/.local/bin/usagebar
 ```
 
 ## Project Structure
