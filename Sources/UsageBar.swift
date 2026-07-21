@@ -4,13 +4,13 @@ import Security
 
 // MARK: - Models
 
-struct ModelLimit {
+struct ModelLimit: Codable {
     let name: String
     let percent: Double
     let reset: Date?
 }
 
-struct ProviderUsage {
+struct ProviderUsage: Codable {
     // nil = the provider does not report this window; the row is hidden
     var sessionPercent: Double?
     var sessionReset: Date?
@@ -18,6 +18,18 @@ struct ProviderUsage {
     var weeklyReset: Date?
     var modelLimits: [ModelLimit] = []
     var error: String?
+}
+
+// Shared across processes (menu bar app + cmux Dock CLI instances) so only
+// one of them actually hits the APIs per refresh interval.
+struct CachedProvider: Codable {
+    var usage: ProviderUsage
+    var fetchedAt: Date
+}
+
+struct UsageCache: Codable {
+    var claude: CachedProvider?
+    var codex: CachedProvider?
 }
 
 struct AppState {
@@ -138,25 +150,75 @@ class UsageAPI {
 
     private var lastGoodClaude: ProviderUsage?
     private var lastGoodCodex: ProviderUsage?
+    private var claudeBackoffUntil = Date.distantPast
+    private var codexBackoffUntil = Date.distantPast
+
+    private let cacheURL = URL(fileURLWithPath: NSHomeDirectory() + "/.cache/usagebar-state.json")
+    // Serve from the shared cache while it is fresher than this, so N running
+    // instances still produce only ~1 API request per interval in total.
+    private let cacheMaxAge: TimeInterval = 55
+    private let backoffInterval: TimeInterval = 300
 
     func fetchAll() async -> AppState {
         var state = AppState()
         state.lastUpdated = Date()
+        let cache = readCache()
 
-        async let c = fetchClaude()
-        async let x = fetchCodex()
-
-        // On transient errors (429 etc.) keep showing the last good data
-        // instead of replacing the whole section with an error label.
-        let claude = await c
-        if claude.error == nil { lastGoodClaude = claude }
-        state.claude = claude.error != nil ? (lastGoodClaude ?? claude) : claude
-
-        let codex = await x
-        if codex.error == nil { lastGoodCodex = codex }
-        state.codex = codex.error != nil ? (lastGoodCodex ?? codex) : codex
+        state.claude = await fetchProvider(
+            cached: cache?.claude, lastGood: &lastGoodClaude, backoffUntil: &claudeBackoffUntil,
+            fetch: fetchClaude, store: { c in self.writeCache { $0.claude = c } })
+        state.codex = await fetchProvider(
+            cached: cache?.codex, lastGood: &lastGoodCodex, backoffUntil: &codexBackoffUntil,
+            fetch: fetchCodex, store: { c in self.writeCache { $0.codex = c } })
 
         return state
+    }
+
+    private func fetchProvider(cached: CachedProvider?,
+                               lastGood: inout ProviderUsage?,
+                               backoffUntil: inout Date,
+                               fetch: () async -> ProviderUsage,
+                               store: (CachedProvider) -> Void) async -> ProviderUsage {
+        let now = Date()
+        // Another instance fetched moments ago — reuse its result.
+        if let c = cached, now.timeIntervalSince(c.fetchedAt) < cacheMaxAge {
+            lastGood = c.usage
+            return c.usage
+        }
+        // Backing off after a 429 — show the best data we have.
+        if now < backoffUntil, let u = lastGood ?? cached?.usage {
+            return u
+        }
+
+        let fetched = await fetch()
+        if fetched.error == nil {
+            lastGood = fetched
+            store(CachedProvider(usage: fetched, fetchedAt: Date()))
+            return fetched
+        }
+        if fetched.error == "Rate limit" {
+            backoffUntil = Date().addingTimeInterval(backoffInterval)
+        }
+        // Transient errors keep the last good data (in-memory or from disk).
+        return lastGood ?? cached?.usage ?? fetched
+    }
+
+    private func readCache() -> UsageCache? {
+        guard let data = try? Data(contentsOf: cacheURL) else { return nil }
+        let d = JSONDecoder(); d.dateDecodingStrategy = .secondsSince1970
+        return try? d.decode(UsageCache.self, from: data)
+    }
+
+    private func writeCache(_ update: (inout UsageCache) -> Void) {
+        // Re-read and merge so concurrent instances don't clobber each other's slot.
+        var cache = readCache() ?? UsageCache()
+        update(&cache)
+        let e = JSONEncoder(); e.dateEncodingStrategy = .secondsSince1970
+        try? FileManager.default.createDirectory(atPath: NSHomeDirectory() + "/.cache",
+                                                 withIntermediateDirectories: true)
+        if let data = try? e.encode(cache) {
+            try? data.write(to: cacheURL, options: .atomic)
+        }
     }
 
     private func fetchClaude() async -> ProviderUsage {
