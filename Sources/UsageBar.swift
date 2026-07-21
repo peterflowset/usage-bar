@@ -4,11 +4,18 @@ import Security
 
 // MARK: - Models
 
+struct ModelLimit {
+    let name: String
+    let percent: Double
+    let reset: Date?
+}
+
 struct ProviderUsage {
     var sessionPercent: Double = 0
     var sessionReset: Date?
     var weeklyPercent: Double = 0
     var weeklyReset: Date?
+    var modelLimits: [ModelLimit] = []
     var error: String?
 }
 
@@ -32,15 +39,31 @@ struct ClaudeUsageResponse: Codable {
         let resetsAt: String?
         enum CodingKeys: String, CodingKey { case usedPercent = "used_percent"; case utilization; case resetsAt = "resets_at" }
     }
+    struct LimitEntry: Codable {
+        struct Scope: Codable {
+            struct Model: Codable {
+                let displayName: String?
+                enum CodingKeys: String, CodingKey { case displayName = "display_name" }
+            }
+            let model: Model?
+        }
+        let kind: String?
+        let percent: Double?
+        let resetsAt: String?
+        let scope: Scope?
+        enum CodingKeys: String, CodingKey { case kind, percent, scope; case resetsAt = "resets_at" }
+    }
     let fiveHour: Limit?
     let sevenDay: Limit?
     let sessionRateLimit: Limit?
     let weeklyRateLimit: Limit?
+    let limits: [LimitEntry]?
     enum CodingKeys: String, CodingKey {
         case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case sessionRateLimit = "session_rate_limit"
         case weeklyRateLimit = "weekly_rate_limit"
+        case limits
     }
 }
 
@@ -90,6 +113,9 @@ struct CodexUsageResponse: Codable {
 class UsageAPI {
     static let shared = UsageAPI()
 
+    private var lastGoodClaude: ProviderUsage?
+    private var lastGoodCodex: ProviderUsage?
+
     func fetchAll() async -> AppState {
         var state = AppState()
         state.lastUpdated = Date()
@@ -97,8 +123,15 @@ class UsageAPI {
         async let c = fetchClaude()
         async let x = fetchCodex()
 
-        state.claude = await c
-        state.codex = await x
+        // On transient errors (429 etc.) keep showing the last good data
+        // instead of replacing the whole section with an error label.
+        let claude = await c
+        if claude.error == nil { lastGoodClaude = claude }
+        state.claude = claude.error != nil ? (lastGoodClaude ?? claude) : claude
+
+        let codex = await x
+        if codex.error == nil { lastGoodCodex = codex }
+        state.codex = codex.error != nil ? (lastGoodCodex ?? codex) : codex
 
         return state
     }
@@ -138,6 +171,13 @@ class UsageAPI {
             if let w = r.sevenDay ?? r.weeklyRateLimit {
                 u.weeklyPercent = w.usedPercent ?? w.utilization ?? 0
                 if let t = w.resetsAt { u.weeklyReset = parseISO(t) }
+            }
+            // Model-scoped weekly limits (e.g. Fable/Opus) from the newer `limits` array
+            for l in r.limits ?? [] where l.kind == "weekly_scoped" {
+                guard let name = l.scope?.model?.displayName else { continue }
+                u.modelLimits.append(ModelLimit(name: name,
+                                                percent: l.percent ?? 0,
+                                                reset: l.resetsAt.flatMap(parseISO)))
             }
         } catch {
             u.error = "Error"
@@ -274,8 +314,12 @@ struct ProviderRow: View {
             if let e = usage.error {
                 Text(e).font(.system(size: 11)).foregroundColor(.red)
             } else {
-                Row(label: "5h", pct: usage.sessionPercent, reset: usage.sessionReset, now: now)
-                Row(label: "7d", pct: usage.weeklyPercent, reset: usage.weeklyReset, now: now)
+                let w: CGFloat = usage.modelLimits.isEmpty ? 20 : 42
+                Row(label: "5h", pct: usage.sessionPercent, reset: usage.sessionReset, now: now, labelWidth: w)
+                Row(label: "7d", pct: usage.weeklyPercent, reset: usage.weeklyReset, now: now, labelWidth: w)
+                ForEach(usage.modelLimits, id: \.name) { m in
+                    Row(label: m.name, pct: m.percent, reset: m.reset, now: now, labelWidth: w)
+                }
             }
         }
     }
@@ -286,10 +330,11 @@ struct Row: View {
     let pct: Double
     let reset: Date?
     let now: Date
+    var labelWidth: CGFloat = 20
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(label).font(.system(size: 11)).foregroundColor(.secondary).frame(width: 20, alignment: .leading)
+            Text(label).font(.system(size: 11)).foregroundColor(.secondary).frame(width: labelWidth, alignment: .leading)
 
             GeometryReader { g in
                 ZStack(alignment: .leading) {
@@ -373,7 +418,7 @@ struct ContentView: View {
     func autoRefresh() async {
         await load()
         while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(30))
+            try? await Task.sleep(for: .seconds(60))
             await load()
         }
     }
