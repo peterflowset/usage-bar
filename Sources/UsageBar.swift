@@ -607,10 +607,21 @@ enum CLI {
 
     static func run(once: Bool) async {
         let f = DateFormatter(); f.dateFormat = "HH:mm"
+        if !once {
+            // Alternate screen buffer + hidden cursor: redraws replace the
+            // frame instead of stacking copies in the scrollback.
+            print("\u{1B}[?1049h\u{1B}[?25l", terminator: "")
+            for sig in [SIGINT, SIGTERM] {
+                signal(sig) { _ in
+                    print("\u{1B}[?1049l\u{1B}[?25h", terminator: "")
+                    exit(0)
+                }
+            }
+        }
         while true {
             let state = await UsageAPI.shared.fetchAll()
             let now = Date()
-            var out = once ? "" : "\u{1B}[2J\u{1B}[H"
+            var out = once ? "" : "\u{1B}[H\u{1B}[2J"
             out += "\u{1B}[1mUsage\u{1B}[0m \u{1B}[2m\(f.string(from: now))\u{1B}[0m\n\n"
             out += section("Claude", state.claude, now: now) + "\n\n"
             out += section("Codex", state.codex, now: now) + "\n"
