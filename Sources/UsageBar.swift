@@ -146,12 +146,23 @@ struct CodexUsageResponse: Codable {
 // MARK: - API Client
 
 class UsageAPI {
-    static let shared = UsageAPI()
+    static let shared = UsageAPI(
+        // A terminal copy has a different code-signing identity from the app
+        // bundle. It must never ask for access to Claude Code's Keychain item;
+        // CLI mode can use fresh statusline data or the cache written by the
+        // menu-bar app instead.
+        allowsClaudeKeychainAccess: !CommandLine.arguments.contains("--cli")
+            && !CommandLine.arguments.contains("--once")
+    )
 
     private var lastGoodClaude: ProviderUsage?
     private var lastGoodCodex: ProviderUsage?
     private var claudeBackoffUntil = Date.distantPast
     private var codexBackoffUntil = Date.distantPast
+    private let allowsClaudeKeychainAccess: Bool
+    private var cachedClaudeKeychainCredentials: ClaudeCredentials?
+    private var didAttemptClaudeKeychainAccess = false
+    private var claudeKeychainModificationDateAtLastAttempt: Date?
 
     private let cacheURL = URL(fileURLWithPath: NSHomeDirectory() + "/.cache/usagebar-state.json")
     // Serve from the shared cache while it is fresher than this, so N running
@@ -159,7 +170,16 @@ class UsageAPI {
     private let cacheMaxAge: TimeInterval = 55
     private let backoffInterval: TimeInterval = 300
 
-    func fetchAll() async -> AppState {
+    init(allowsClaudeKeychainAccess: Bool = true) {
+        self.allowsClaudeKeychainAccess = allowsClaudeKeychainAccess
+    }
+
+    func fetchAll(forceClaudeAuthRetry: Bool = false) async -> AppState {
+        if forceClaudeAuthRetry {
+            didAttemptClaudeKeychainAccess = false
+            claudeKeychainModificationDateAtLastAttempt = nil
+        }
+
         var state = AppState()
         state.lastUpdated = Date()
         let cache = readCache()
@@ -301,8 +321,24 @@ class UsageAPI {
 
     private func fetchClaudeAccessToken() -> (token: String?, error: String?) {
         // macOS keeps the live token in the login keychain; a leftover
-        // ~/.claude/.credentials.json may hold a long-expired one. Prefer
-        // whichever source is not expired (keychain first).
+        // ~/.claude/.credentials.json may hold a long-expired one.
+        // Keep a successful Keychain read in memory: querying the item on
+        // every refresh can repeatedly display macOS authorization prompts.
+        if let cached = cachedClaudeKeychainCredentials, !cached.isExpired {
+            return (cached.claudeAiOauth.accessToken, nil)
+        }
+        if cachedClaudeKeychainCredentials?.isExpired == true {
+            cachedClaudeKeychainCredentials = nil
+            didAttemptClaudeKeychainAccess = false
+            claudeKeychainModificationDateAtLastAttempt = nil
+        }
+        if cachedClaudeKeychainCredentials == nil,
+           allowsClaudeKeychainAccess,
+           let cached = loadOwnClaudeTokenCache() {
+            cachedClaudeKeychainCredentials = cached
+            return (cached.claudeAiOauth.accessToken, nil)
+        }
+
         var fileError: String?
         var fileToken: String?
         let path = NSHomeDirectory() + "/.claude/.credentials.json"
@@ -318,6 +354,28 @@ class UsageAPI {
             }
         }
 
+        // Reading Keychain metadata does not expose the secret or show an auth
+        // prompt. If Claude Code replaced/refreshed the credential after our
+        // last denied lookup, allow one new attempt so the app can recover
+        // without a relaunch. An unchanged item stays latched to avoid showing
+        // the same authorization prompt every minute.
+        let currentKeychainModificationDate = allowsClaudeKeychainAccess
+            ? claudeKeychainModificationDate()
+            : nil
+        if didAttemptClaudeKeychainAccess,
+           let currentKeychainModificationDate,
+           let lastAttemptDate = claudeKeychainModificationDateAtLastAttempt,
+           currentKeychainModificationDate != lastAttemptDate {
+            didAttemptClaudeKeychainAccess = false
+        }
+
+        // CLI mode deliberately never reads Keychain credentials.
+        guard allowsClaudeKeychainAccess, !didAttemptClaudeKeychainAccess else {
+            return (fileToken, fileToken != nil ? nil : (fileError ?? "No auth"))
+        }
+        didAttemptClaudeKeychainAccess = true
+        claudeKeychainModificationDateAtLastAttempt = currentKeychainModificationDate
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -328,6 +386,11 @@ class UsageAPI {
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         switch status {
         case errSecSuccess:
+            // The read succeeded, so no authorization prompt is in play:
+            // keep retrying on later refreshes even if the payload is
+            // unusable right now (Claude Code refreshes the item over time).
+            didAttemptClaudeKeychainAccess = false
+            claudeKeychainModificationDateAtLastAttempt = nil
             guard let data = item as? Data,
                   let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
                 return (fileToken, fileToken != nil ? nil : "Auth format")
@@ -335,8 +398,12 @@ class UsageAPI {
             if creds.isExpired {
                 return (fileToken, fileToken != nil ? nil : "Auth expired")
             }
+            cachedClaudeKeychainCredentials = creds
+            storeOwnClaudeTokenCache(creds)
             return (creds.claudeAiOauth.accessToken, nil)
         case errSecItemNotFound:
+            didAttemptClaudeKeychainAccess = false
+            claudeKeychainModificationDateAtLastAttempt = nil
             return (fileToken, fileToken != nil ? nil : (fileError ?? "No auth"))
         case errSecInteractionNotAllowed:
             return (fileToken, fileToken != nil ? nil : "Keychain locked")
@@ -345,6 +412,72 @@ class UsageAPI {
         default:
             return (fileToken, fileToken != nil ? nil : "Keychain \(status)")
         }
+    }
+
+    private func storeOwnClaudeTokenCache(_ creds: ClaudeCredentials) {
+        guard allowsClaudeKeychainAccess,
+              let data = try? JSONEncoder().encode(creds) else {
+            return
+        }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.local.usagebar.claude-token-cache",
+            kSecAttrAccount as String: "claude",
+            kSecValueData as String: data,
+        ]
+        if SecItemAdd(query as CFDictionary, nil) == errSecDuplicateItem {
+            let match: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "com.local.usagebar.claude-token-cache",
+                kSecAttrAccount as String: "claude",
+            ]
+            SecItemUpdate(
+                match as CFDictionary,
+                [kSecValueData as String: data] as CFDictionary
+            )
+        }
+    }
+
+    private func loadOwnClaudeTokenCache() -> ClaudeCredentials? {
+        guard allowsClaudeKeychainAccess else { return nil }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.local.usagebar.claude-token-cache",
+            kSecAttrAccount as String: "claude",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
+            return nil
+        }
+        if creds.isExpired {
+            let deleteQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "com.local.usagebar.claude-token-cache",
+                kSecAttrAccount as String: "claude",
+            ]
+            SecItemDelete(deleteQuery as CFDictionary)
+            return nil
+        }
+        return creds
+    }
+
+    private func claudeKeychainModificationDate() -> Date? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let attributes = item as? [String: Any] else {
+            return nil
+        }
+        return attributes[kSecAttrModificationDate as String] as? Date
     }
 
     private func fetchCodex() async -> ProviderUsage {
@@ -497,7 +630,7 @@ struct ContentView: View {
                 if loading {
                     ProgressView().scaleEffect(0.5)
                 } else {
-                    Button(action: { Task { await load() } }) {
+                    Button(action: { Task { await load(forceClaudeAuthRetry: true) } }) {
                         Image(systemName: "arrow.clockwise").font(.system(size: 11))
                     }.buttonStyle(.plain).foregroundColor(.secondary)
                 }
@@ -523,9 +656,9 @@ struct ContentView: View {
         .task { await autoRefresh() }
     }
 
-    func load() async {
+    func load(forceClaudeAuthRetry: Bool = false) async {
         loading = true
-        state = await UsageAPI.shared.fetchAll()
+        state = await UsageAPI.shared.fetchAll(forceClaudeAuthRetry: forceClaudeAuthRetry)
         now = Date()
         loading = false
     }

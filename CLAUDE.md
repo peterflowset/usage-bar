@@ -21,6 +21,12 @@ swift build -c release
 
 # Install CLI copy used by the cmux Dock control (~/.config/cmux/dock.json)
 cp ./.build/release/UsageBar ~/.local/bin/usagebar
+
+# Install the menu bar app: copy the binary into the bundle, then ALWAYS re-sign.
+# Without this, the app is ad-hoc signed (identity = per-build cdhash) and the
+# keychain "Always Allow" grant for Claude Code-credentials breaks on every build.
+cp ./.build/release/UsageBar /Applications/UsageBar.app/Contents/MacOS/UsageBar
+codesign --force --sign "Apple Development: peter.kassi@icloud.com (LSN94AS8XC)" /Applications/UsageBar.app
 ```
 
 ## Project Structure
