@@ -1,8 +1,9 @@
 import SwiftUI
 import AppKit
-import Security
 
 // MARK: - Models
+
+let usageStalenessThreshold: TimeInterval = 300
 
 struct ModelLimit: Codable {
     let name: String
@@ -18,6 +19,12 @@ struct ProviderUsage: Codable {
     var weeklyReset: Date?
     var modelLimits: [ModelLimit] = []
     var error: String?
+    var fetchedAt: Date?
+    var shouldBackoff = false
+
+    enum CodingKeys: String, CodingKey {
+        case sessionPercent, sessionReset, weeklyPercent, weeklyReset, modelLimits, error, fetchedAt
+    }
 }
 
 // Shared across processes (menu bar app + cmux Dock CLI instances) so only
@@ -88,19 +95,19 @@ struct ClaudeUsageResponse: Codable {
     }
 }
 
-struct ClaudeStatuslineDebug: Codable {
-    struct RateLimits: Codable {
-        struct Window: Codable {
-            let usedPercentage: Double?
-            let resetsAt: Int64?
-            enum CodingKeys: String, CodingKey { case usedPercentage = "used_percentage"; case resetsAt = "resets_at" }
-        }
-        let fiveHour: Window?
-        let sevenDay: Window?
-        enum CodingKeys: String, CodingKey { case fiveHour = "five_hour"; case sevenDay = "seven_day" }
+struct ClaudeStatuslineCache: Codable {
+    let claudeWeekly: String?
+    let claudeSession: String?
+    let weeklyReset: String?
+    let sessionReset: String?
+    let ts: Double
+    enum CodingKeys: String, CodingKey {
+        case claudeWeekly = "claude_weekly"
+        case claudeSession = "claude_session"
+        case weeklyReset = "weekly_reset"
+        case sessionReset = "session_reset"
+        case ts
     }
-    let rateLimits: RateLimits?
-    enum CodingKeys: String, CodingKey { case rateLimits = "rate_limits" }
 }
 
 // MARK: - Codex API
@@ -146,23 +153,12 @@ struct CodexUsageResponse: Codable {
 // MARK: - API Client
 
 class UsageAPI {
-    static let shared = UsageAPI(
-        // A terminal copy has a different code-signing identity from the app
-        // bundle. It must never ask for access to Claude Code's Keychain item;
-        // CLI mode can use fresh statusline data or the cache written by the
-        // menu-bar app instead.
-        allowsClaudeKeychainAccess: !CommandLine.arguments.contains("--cli")
-            && !CommandLine.arguments.contains("--once")
-    )
+    static let shared = UsageAPI()
 
     private var lastGoodClaude: ProviderUsage?
     private var lastGoodCodex: ProviderUsage?
     private var claudeBackoffUntil = Date.distantPast
     private var codexBackoffUntil = Date.distantPast
-    private let allowsClaudeKeychainAccess: Bool
-    private var cachedClaudeKeychainCredentials: ClaudeCredentials?
-    private var didAttemptClaudeKeychainAccess = false
-    private var claudeKeychainModificationDateAtLastAttempt: Date?
 
     private let cacheURL = URL(fileURLWithPath: NSHomeDirectory() + "/.cache/usagebar-state.json")
     // Serve from the shared cache while it is fresher than this, so N running
@@ -170,23 +166,24 @@ class UsageAPI {
     private let cacheMaxAge: TimeInterval = 55
     private let backoffInterval: TimeInterval = 300
 
-    init(allowsClaudeKeychainAccess: Bool = true) {
-        self.allowsClaudeKeychainAccess = allowsClaudeKeychainAccess
-    }
-
-    func fetchAll(forceClaudeAuthRetry: Bool = false) async -> AppState {
-        if forceClaudeAuthRetry {
-            didAttemptClaudeKeychainAccess = false
-            claudeKeychainModificationDateAtLastAttempt = nil
-        }
-
+    func fetchAll() async -> AppState {
         var state = AppState()
         state.lastUpdated = Date()
         let cache = readCache()
 
-        state.claude = await fetchProvider(
-            cached: cache?.claude, lastGood: &lastGoodClaude, backoffUntil: &claudeBackoffUntil,
-            fetch: fetchClaude, store: { c in self.writeCache { $0.claude = c } })
+        // Do not let an older API result reintroduce model-scoped limits when
+        // this process can only serve the auth-free statusline source.
+        if fetchClaudeAccessToken().token == nil,
+           let local = fetchClaudeFromStatuslineCache(),
+           let fetchedAt = local.fetchedAt {
+            state.claude = local
+            lastGoodClaude = local
+            writeCache { $0.claude = CachedProvider(usage: local, fetchedAt: fetchedAt) }
+        } else {
+            state.claude = await fetchProvider(
+                cached: cache?.claude, lastGood: &lastGoodClaude, backoffUntil: &claudeBackoffUntil,
+                fetch: fetchClaude, store: { c in self.writeCache { $0.claude = c } })
+        }
         state.codex = await fetchProvider(
             cached: cache?.codex, lastGood: &lastGoodCodex, backoffUntil: &codexBackoffUntil,
             fetch: fetchCodex, store: { c in self.writeCache { $0.codex = c } })
@@ -202,25 +199,32 @@ class UsageAPI {
         let now = Date()
         // Another instance fetched moments ago — reuse its result.
         if let c = cached, now.timeIntervalSince(c.fetchedAt) < cacheMaxAge {
-            lastGood = c.usage
-            return c.usage
+            var usage = c.usage
+            usage.fetchedAt = usage.fetchedAt ?? c.fetchedAt
+            lastGood = usage
+            return usage
         }
         // Backing off after a 429 — show the best data we have.
-        if now < backoffUntil, let u = lastGood ?? cached?.usage {
-            return u
+        if now < backoffUntil, var usage = lastGood ?? cached?.usage {
+            usage.fetchedAt = usage.fetchedAt ?? cached?.fetchedAt
+            return usage
         }
 
         let fetched = await fetch()
-        if fetched.error == nil {
-            lastGood = fetched
-            store(CachedProvider(usage: fetched, fetchedAt: Date()))
-            return fetched
-        }
-        if fetched.error == "Rate limit" {
+        if fetched.shouldBackoff || fetched.error == "Rate limit" {
             backoffUntil = Date().addingTimeInterval(backoffInterval)
         }
+        if fetched.error == nil {
+            lastGood = fetched
+            store(CachedProvider(usage: fetched, fetchedAt: fetched.fetchedAt ?? Date()))
+            return fetched
+        }
         // Transient errors keep the last good data (in-memory or from disk).
-        return lastGood ?? cached?.usage ?? fetched
+        if var usage = lastGood ?? cached?.usage {
+            usage.fetchedAt = usage.fetchedAt ?? cached?.fetchedAt
+            return usage
+        }
+        return fetched
     }
 
     private func readCache() -> UsageCache? {
@@ -242,16 +246,11 @@ class UsageAPI {
     }
 
     private func fetchClaude() async -> ProviderUsage {
-        if let local = fetchClaudeFromStatusline() {
-            return local
-        }
-
         var u = ProviderUsage()
-
         let auth = fetchClaudeAccessToken()
         guard let token = auth.token else {
             u.error = auth.error ?? "No auth"
-            return u
+            return fetchClaudeFromStatuslineCache() ?? u
         }
 
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
@@ -262,10 +261,14 @@ class UsageAPI {
             let (data, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse else {
                 u.error = "Network"
-                return u
+                return fetchClaudeFromStatuslineCache() ?? u
             }
             guard http.statusCode == 200 else {
                 u.error = http.statusCode == 429 ? "Rate limit" : "API \(http.statusCode)"
+                if var local = fetchClaudeFromStatuslineCache() {
+                    local.shouldBackoff = http.statusCode == 429
+                    return local
+                }
                 return u
             }
             let r = try JSONDecoder().decode(ClaudeUsageResponse.self, from: data)
@@ -284,200 +287,53 @@ class UsageAPI {
                                                 percent: l.percent ?? 0,
                                                 reset: l.resetsAt.flatMap(parseISO)))
             }
+            u.fetchedAt = Date()
+            return u
         } catch {
             u.error = "Error"
+            return fetchClaudeFromStatuslineCache() ?? u
         }
-        return u
     }
 
-    private func fetchClaudeFromStatusline() -> ProviderUsage? {
-        let path = NSHomeDirectory() + "/.claude/statusline-debug.json"
-        // Only trust the cached file when it was written very recently
-        // (i.e. an active Claude Code session is producing fresh data).
-        // Otherwise the values may belong to a previous account/session
-        // and we should hit the live API instead.
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              let mtime = attrs[.modificationDate] as? Date,
-              Date().timeIntervalSince(mtime) < 60 else {
-            return nil
-        }
+    private func fetchClaudeFromStatuslineCache() -> ProviderUsage? {
+        let path = NSHomeDirectory() + "/.claude/usage-cache.json"
         guard let data = FileManager.default.contents(atPath: path),
-              let debug = try? JSONDecoder().decode(ClaudeStatuslineDebug.self, from: data),
-              debug.rateLimits != nil else {
+              let cache = try? JSONDecoder().decode(ClaudeStatuslineCache.self, from: data) else {
             return nil
         }
+        let fetchedAt = Date(timeIntervalSince1970: cache.ts)
+        guard Date().timeIntervalSince(fetchedAt) <= 900 else { return nil }
 
         var u = ProviderUsage()
-        if let s = debug.rateLimits?.fiveHour {
-            u.sessionPercent = s.usedPercentage ?? 0
-            if let t = s.resetsAt { u.sessionReset = Date(timeIntervalSince1970: Double(t)) }
-        }
-        if let w = debug.rateLimits?.sevenDay {
-            u.weeklyPercent = w.usedPercentage ?? 0
-            if let t = w.resetsAt { u.weeklyReset = Date(timeIntervalSince1970: Double(t)) }
-        }
+        u.sessionPercent = cache.claudeSession.flatMap(Double.init)
+        u.weeklyPercent = cache.claudeWeekly.flatMap(Double.init)
+        u.sessionReset = cache.sessionReset.flatMap(Double.init).map(Date.init(timeIntervalSince1970:))
+        u.weeklyReset = cache.weeklyReset.flatMap(Double.init).map(Date.init(timeIntervalSince1970:))
+        u.fetchedAt = fetchedAt
+        guard u.sessionPercent != nil || u.weeklyPercent != nil else { return nil }
         return u
     }
 
     private func fetchClaudeAccessToken() -> (token: String?, error: String?) {
-        // macOS keeps the live token in the login keychain; a leftover
-        // ~/.claude/.credentials.json may hold a long-expired one.
-        // Keep a successful Keychain read in memory: querying the item on
-        // every refresh can repeatedly display macOS authorization prompts.
-        if let cached = cachedClaudeKeychainCredentials, !cached.isExpired {
-            return (cached.claudeAiOauth.accessToken, nil)
-        }
-        if cachedClaudeKeychainCredentials?.isExpired == true {
-            cachedClaudeKeychainCredentials = nil
-            didAttemptClaudeKeychainAccess = false
-            claudeKeychainModificationDateAtLastAttempt = nil
-        }
-        if cachedClaudeKeychainCredentials == nil,
-           allowsClaudeKeychainAccess,
-           let cached = loadOwnClaudeTokenCache() {
-            cachedClaudeKeychainCredentials = cached
-            return (cached.claudeAiOauth.accessToken, nil)
+        // The app bundle and CLI have different signing identities, so sharing a
+        // Keychain item prompts for authorization. A 0600 file avoids that
+        // asymmetry and matches the Codex auth-file design.
+        let tokenPath = NSHomeDirectory() + "/.config/usagebar/token"
+        if let token = try? String(contentsOfFile: tokenPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !token.isEmpty {
+            return (token, nil)
         }
 
-        var fileError: String?
-        var fileToken: String?
         let path = NSHomeDirectory() + "/.claude/.credentials.json"
-        if let data = FileManager.default.contents(atPath: path) {
-            if let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) {
-                if creds.isExpired {
-                    fileError = "Auth expired"
-                } else {
-                    fileToken = creds.claudeAiOauth.accessToken
-                }
-            } else {
-                fileError = "Auth format"
-            }
+        guard let data = FileManager.default.contents(atPath: path) else {
+            return (nil, "No auth")
         }
-
-        // Reading Keychain metadata does not expose the secret or show an auth
-        // prompt. If Claude Code replaced/refreshed the credential after our
-        // last denied lookup, allow one new attempt so the app can recover
-        // without a relaunch. An unchanged item stays latched to avoid showing
-        // the same authorization prompt every minute.
-        let currentKeychainModificationDate = allowsClaudeKeychainAccess
-            ? claudeKeychainModificationDate()
-            : nil
-        if didAttemptClaudeKeychainAccess,
-           let currentKeychainModificationDate,
-           let lastAttemptDate = claudeKeychainModificationDateAtLastAttempt,
-           currentKeychainModificationDate != lastAttemptDate {
-            didAttemptClaudeKeychainAccess = false
+        guard let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
+            return (nil, "Auth format")
         }
-
-        // CLI mode deliberately never reads Keychain credentials.
-        guard allowsClaudeKeychainAccess, !didAttemptClaudeKeychainAccess else {
-            return (fileToken, fileToken != nil ? nil : (fileError ?? "No auth"))
-        }
-        didAttemptClaudeKeychainAccess = true
-        claudeKeychainModificationDateAtLastAttempt = currentKeychainModificationDate
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        switch status {
-        case errSecSuccess:
-            // The read succeeded, so no authorization prompt is in play:
-            // keep retrying on later refreshes even if the payload is
-            // unusable right now (Claude Code refreshes the item over time).
-            didAttemptClaudeKeychainAccess = false
-            claudeKeychainModificationDateAtLastAttempt = nil
-            guard let data = item as? Data,
-                  let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
-                return (fileToken, fileToken != nil ? nil : "Auth format")
-            }
-            if creds.isExpired {
-                return (fileToken, fileToken != nil ? nil : "Auth expired")
-            }
-            cachedClaudeKeychainCredentials = creds
-            storeOwnClaudeTokenCache(creds)
-            return (creds.claudeAiOauth.accessToken, nil)
-        case errSecItemNotFound:
-            didAttemptClaudeKeychainAccess = false
-            claudeKeychainModificationDateAtLastAttempt = nil
-            return (fileToken, fileToken != nil ? nil : (fileError ?? "No auth"))
-        case errSecInteractionNotAllowed:
-            return (fileToken, fileToken != nil ? nil : "Keychain locked")
-        case errSecAuthFailed, errSecUserCanceled:
-            return (fileToken, fileToken != nil ? nil : "Keychain denied")
-        default:
-            return (fileToken, fileToken != nil ? nil : "Keychain \(status)")
-        }
-    }
-
-    private func storeOwnClaudeTokenCache(_ creds: ClaudeCredentials) {
-        guard allowsClaudeKeychainAccess,
-              let data = try? JSONEncoder().encode(creds) else {
-            return
-        }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.local.usagebar.claude-token-cache",
-            kSecAttrAccount as String: "claude",
-            kSecValueData as String: data,
-        ]
-        if SecItemAdd(query as CFDictionary, nil) == errSecDuplicateItem {
-            let match: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: "com.local.usagebar.claude-token-cache",
-                kSecAttrAccount as String: "claude",
-            ]
-            SecItemUpdate(
-                match as CFDictionary,
-                [kSecValueData as String: data] as CFDictionary
-            )
-        }
-    }
-
-    private func loadOwnClaudeTokenCache() -> ClaudeCredentials? {
-        guard allowsClaudeKeychainAccess else { return nil }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.local.usagebar.claude-token-cache",
-            kSecAttrAccount as String: "claude",
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let creds = try? JSONDecoder().decode(ClaudeCredentials.self, from: data) else {
-            return nil
-        }
-        if creds.isExpired {
-            let deleteQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: "com.local.usagebar.claude-token-cache",
-                kSecAttrAccount as String: "claude",
-            ]
-            SecItemDelete(deleteQuery as CFDictionary)
-            return nil
-        }
-        return creds
-    }
-
-    private func claudeKeychainModificationDate() -> Date? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let attributes = item as? [String: Any] else {
-            return nil
-        }
-        return attributes[kSecAttrModificationDate as String] as? Date
+        guard !creds.isExpired else { return (nil, "Auth expired") }
+        return (creds.claudeAiOauth.accessToken, nil)
     }
 
     private func fetchCodex() async -> ProviderUsage {
@@ -531,6 +387,7 @@ class UsageAPI {
                                                 percent: Double(w.usedPercent ?? 0),
                                                 reset: w.resetAt.map { Date(timeIntervalSince1970: Double($0)) }))
             }
+            u.fetchedAt = Date()
         } catch {
             u.error = "Error"
         }
@@ -551,25 +408,43 @@ struct ProviderRow: View {
     let usage: ProviderUsage
     let now: Date
 
+    var isStale: Bool {
+        guard let fetchedAt = usage.fetchedAt else { return false }
+        return now.timeIntervalSince(fetchedAt) > usageStalenessThreshold
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(name).font(.system(size: 12, weight: .semibold))
-
-            if let e = usage.error {
-                Text(e).font(.system(size: 11)).foregroundColor(.red)
-            } else {
-                let w: CGFloat = usage.modelLimits.isEmpty ? 20 : 42
-                if let p = usage.sessionPercent {
-                    Row(label: "5h", pct: p, reset: usage.sessionReset, now: now, labelWidth: w)
-                }
-                if let p = usage.weeklyPercent {
-                    Row(label: "7d", pct: p, reset: usage.weeklyReset, now: now, labelWidth: w)
-                }
-                ForEach(usage.modelLimits, id: \.name) { m in
-                    Row(label: m.name, pct: m.percent, reset: m.reset, now: now, labelWidth: w)
+            HStack(spacing: 4) {
+                Text(name).font(.system(size: 12, weight: .semibold))
+                if isStale, let fetchedAt = usage.fetchedAt {
+                    Text("as of \(time(fetchedAt))")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
                 }
             }
+
+            Group {
+                if let e = usage.error {
+                    Text(e).font(.system(size: 11)).foregroundColor(.red)
+                } else {
+                    let w: CGFloat = usage.modelLimits.isEmpty ? 20 : 42
+                    if let p = usage.sessionPercent {
+                        Row(label: "5h", pct: p, reset: usage.sessionReset, now: now, labelWidth: w)
+                    }
+                    if let p = usage.weeklyPercent {
+                        Row(label: "7d", pct: p, reset: usage.weeklyReset, now: now, labelWidth: w)
+                    }
+                    ForEach(usage.modelLimits, id: \.name) { m in
+                        Row(label: m.name, pct: m.percent, reset: m.reset, now: now, labelWidth: w)
+                    }
+                }
+            }.opacity(isStale ? 0.45 : 1)
         }
+    }
+
+    func time(_ d: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
     }
 }
 
@@ -630,7 +505,7 @@ struct ContentView: View {
                 if loading {
                     ProgressView().scaleEffect(0.5)
                 } else {
-                    Button(action: { Task { await load(forceClaudeAuthRetry: true) } }) {
+                    Button(action: { Task { await load() } }) {
                         Image(systemName: "arrow.clockwise").font(.system(size: 11))
                     }.buttonStyle(.plain).foregroundColor(.secondary)
                 }
@@ -656,9 +531,9 @@ struct ContentView: View {
         .task { await autoRefresh() }
     }
 
-    func load(forceClaudeAuthRetry: Bool = false) async {
+    func load() async {
         loading = true
-        state = await UsageAPI.shared.fetchAll(forceClaudeAuthRetry: forceClaudeAuthRetry)
+        state = await UsageAPI.shared.fetchAll()
         now = Date()
         loading = false
     }
@@ -727,7 +602,15 @@ enum CLI {
     }
 
     static func section(_ name: String, _ u: ProviderUsage, now: Date) -> String {
-        var lines = ["\u{1B}[1m\(name)\u{1B}[0m"]
+        let stale = u.fetchedAt.map { now.timeIntervalSince($0) > usageStalenessThreshold } ?? false
+        let asOf: String
+        if stale, let fetchedAt = u.fetchedAt {
+            let f = DateFormatter(); f.dateFormat = "HH:mm"
+            asOf = "\u{1B}[2m (as of \(f.string(from: fetchedAt)))\u{1B}[0m"
+        } else {
+            asOf = ""
+        }
+        var lines = ["\u{1B}[1m\(name)\u{1B}[0m\(asOf)"]
         if let e = u.error {
             lines.append("  \u{1B}[31m\(e)\u{1B}[0m")
         } else {

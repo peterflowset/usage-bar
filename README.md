@@ -60,16 +60,33 @@ swift build -c release
 
 ## Setup
 
-The app reads credentials from the standard locations used by the CLI tools:
+The app reads local usage data and optional API credentials from plain files:
 
 ### Claude Code
 
-Authenticate with Claude Code CLI first:
+Claude Code's statusline script writes live 5-hour and 7-day usage to
+`~/.claude/usage-cache.json`; UsageBar accepts entries up to 15 minutes old.
+
+For live API data including model-scoped limits (Opus/Fable weekly), give
+UsageBar its own long-lived token. `claude setup-token` is interactive — it
+opens a browser and prints the token, so save it in a second step rather than
+redirecting its output:
+
 ```bash
-claude login
+claude setup-token                       # prints an sk-ant-oat01-… token
+mkdir -p ~/.config/usagebar && chmod 700 ~/.config/usagebar
+printf '%s' '<paste-token>' > ~/.config/usagebar/token
+chmod 600 ~/.config/usagebar/token
 ```
 
-UsageBar reads Claude Code usage from `~/.claude/statusline-debug.json`, which is maintained by Claude Code. If that file is not available, it falls back to the OAuth usage API when `~/.claude/.credentials.json` exists.
+UsageBar never reads Claude Code's macOS Keychain item — the app bundle and the
+`--cli` copy have different code-signing identities, so any shared Keychain item
+makes one of them trigger an authorization prompt. A 0600 file avoids that, and
+matches how the Codex path already reads `~/.codex/auth.json`.
+
+If the token file is absent, UsageBar can also use an unexpired
+`~/.claude/.credentials.json`; without either, it runs on the statusline cache
+alone and simply omits the model-scoped rows.
 
 ### Codex (OpenAI)
 
@@ -87,20 +104,22 @@ The cache file must follow this format:
 
 ```json
 {
-  "claude_weekly":  28,
-  "claude_session": 42,
-  "weekly_reset":   1712419200,
-  "session_reset":  1712332800
+  "claude_weekly": "28",
+  "claude_session": "42",
+  "weekly_reset": "1712419200",
+  "session_reset": "1712332800",
+  "ts": 1712330000
 }
 ```
 
-- `claude_weekly` / `claude_session`: percent used (0–100)
-- `weekly_reset` / `session_reset`: Unix timestamp (seconds since epoch) of the next reset
+- `claude_weekly` / `claude_session`: percent used (0–100), encoded as strings
+- `weekly_reset` / `session_reset`: Unix timestamps encoded as strings
+- `ts`: numeric Unix timestamp for when the cache was written
 
 ## How It Works
 
-1. Reads Claude Code usage from `~/.claude/statusline-debug.json`
-2. Falls back to the Claude OAuth usage API when local status data is unavailable
+1. Calls the Claude OAuth usage API when a file-based token is available
+2. Falls back to fresh Claude usage from `~/.claude/usage-cache.json`
 3. Reads Codex OAuth tokens from `~/.codex/auth.json`
 4. Calls the Codex usage API: `chatgpt.com/backend-api/wham/usage`
 5. Refreshes usage automatically and displays percentages and reset timers in a floating panel
